@@ -28,6 +28,7 @@ import dev.touchpilot.app.androidcontrol.AccessibilityBridge
 import dev.touchpilot.app.localinference.LiteRtCommandModelRuntime
 import dev.touchpilot.app.logging.DebugTraceExporter
 import dev.touchpilot.app.memory.Skill
+import dev.touchpilot.app.memory.SkillFileStore
 import dev.touchpilot.app.memory.SharedPreferencesSkillStore
 import dev.touchpilot.app.memory.SkillRegistry
 import dev.touchpilot.app.memory.SkillStore
@@ -35,6 +36,7 @@ import dev.touchpilot.app.navigation.AppSection
 import dev.touchpilot.app.navigation.NavigationController
 import dev.touchpilot.app.navigation.SettingsPanel
 import dev.touchpilot.app.workflow.WorkflowTraceStore
+import dev.touchpilot.app.demonstration.export.DemonstrationWorkflowConverter
 import dev.touchpilot.app.runtime.ToolExecutionCallbacks
 import dev.touchpilot.app.runtime.ToolExecutionController
 import dev.touchpilot.app.security.ToolApprovalProvider
@@ -65,6 +67,8 @@ import java.io.File
 
 class MainActivity : Activity() {
     private lateinit var preferences: SharedPreferences
+    private lateinit var skillStore: SkillStore
+    private lateinit var skillFileStore: SkillFileStore
     private lateinit var skillRegistry: SkillRegistry
     private lateinit var toolExecutor: AndroidToolExecutor
     private lateinit var debugTraceExporter: DebugTraceExporter
@@ -96,17 +100,9 @@ class MainActivity : Activity() {
             rootDir = File(filesDir, "workflows"),
             seedDefinitions = WorkflowSeedLoader.load(this)
         )
-        val skillLoad = SkillStore(this).load()
-        skillRegistry = SkillRegistry(skillLoad.skills, SharedPreferencesSkillStore(preferences))
-        skillLoad.invalid.forEach { invalid ->
-            ToolExecutionLog.record(
-                name = "skill_load_failed",
-                args = "skill=${invalid.id}",
-                ok = false,
-                message = invalid.errors.joinToString("; "),
-                source = "skills"
-            )
-        }
+        skillFileStore = SkillFileStore(File(filesDir, "skills"))
+        skillStore = SkillStore(this)
+        reloadSkills()
         toolExecutor = AndroidToolExecutor(this)
         workflowTraceStore = WorkflowTraceStore(traceDirectory())
         debugTraceExporter = DebugTraceExporter(
@@ -530,6 +526,8 @@ class MainActivity : Activity() {
                     dev.touchpilot.app.demonstration.DemonstrationPreferences.recordingConfig(preferences)
                 )
             },
+            demonstrationSessions = { demonstrationManager.sessions },
+            onDemonstrationReplayRequested = ::replayDemonstration,
         ).render()
     }
 
@@ -643,7 +641,8 @@ class MainActivity : Activity() {
             runId = navigationController.activeRunDetailId,
             findAgentRun = ::findAgentRun,
             closeRunDetail = ::closeRunDetail,
-            exportRunTrace = ::exportRunTrace
+            exportRunTrace = ::exportRunTrace,
+            saveSkillCandidate = ::saveSkillCandidate
         ).render()
     }
 
@@ -653,6 +652,56 @@ class MainActivity : Activity() {
 
     private fun exportDebugTrace(): File {
         return debugTraceExporter.exportDebugTrace()
+    }
+
+    private fun reloadSkills() {
+        val skillLoad = skillStore.load()
+        skillRegistry = SkillRegistry(skillLoad.skills, SharedPreferencesSkillStore(preferences))
+        skillLoad.invalid.forEach { invalid ->
+            ToolExecutionLog.record(
+                name = "skill_load_failed",
+                args = "skill=${invalid.id}",
+                ok = false,
+                message = invalid.errors.joinToString("; "),
+                source = "skills"
+            )
+        }
+    }
+
+    private fun saveSkillCandidate(id: String, markdown: String): Boolean {
+        val result = skillFileStore.saveIfValid(id, markdown)
+        return when (result) {
+            is dev.touchpilot.app.memory.SkillParseResult.Valid -> {
+                reloadSkills()
+                android.widget.Toast.makeText(
+                    this,
+                    "Saved skill candidate ${result.skill.id}",
+                    android.widget.Toast.LENGTH_SHORT
+                ).show()
+                true
+            }
+            is dev.touchpilot.app.memory.SkillParseResult.Invalid -> {
+                android.widget.Toast.makeText(
+                    this,
+                    result.errors.joinToString("\n"),
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+                false
+            }
+        }
+    }
+
+    private fun replayDemonstration(sessionId: String) {
+        val session = demonstrationManager.findSession(sessionId)
+        val workflow = session?.let(DemonstrationWorkflowConverter::toWorkflowDefinition) ?: run {
+            android.widget.Toast.makeText(
+                this,
+                "That demonstration cannot be replayed.",
+                android.widget.Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+        agentRunController.startWorkflowReplay(definition = workflow)
     }
 
 }
