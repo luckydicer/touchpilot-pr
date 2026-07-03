@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import android.graphics.Color
 import android.graphics.Typeface
 import android.text.InputType
+import android.util.Log
 import android.view.View
 import android.view.ViewGroup
 import android.widget.LinearLayout
@@ -13,17 +14,31 @@ import com.google.android.material.card.MaterialCardView
 import dev.touchpilot.app.R
 import dev.touchpilot.app.agent.AgentProviderMode
 import dev.touchpilot.app.localinference.LiteRtCommandModelRuntime
-import dev.touchpilot.app.mcp.McpHttpClient
+import dev.touchpilot.app.mcp.ExternalCapabilityInvoker
+import dev.touchpilot.app.mcp.ExternalCapabilityInvokeResult
 import dev.touchpilot.app.mcp.LocalExtensionTool
 import dev.touchpilot.app.mcp.LocalExtensionParseResult
 import dev.touchpilot.app.mcp.LocalExtensionToolStore
 import dev.touchpilot.app.mcp.PluginApiManifest
+import dev.touchpilot.app.security.AesGcmSecretCipher
+import dev.touchpilot.app.security.AndroidKeystoreSecretKeyProvider
+import dev.touchpilot.app.security.EncryptedSecretStore
+import dev.touchpilot.app.security.ExternalCapabilityAction
+import dev.touchpilot.app.security.ExternalCapabilityInvocation
+import dev.touchpilot.app.security.ExternalCapabilityKind
+import dev.touchpilot.app.security.ExternalCapabilityPermissionStore
+import dev.touchpilot.app.security.ExternalCapabilityPolicy
+import dev.touchpilot.app.security.ExternalCapabilityTarget
+import dev.touchpilot.app.security.ExternalCapabilityTargetResolver
+import dev.touchpilot.app.security.SharedPreferencesSecretPreferences
 import dev.touchpilot.app.memory.Skill
 import dev.touchpilot.app.memory.SkillDetailFormatter
 import dev.touchpilot.app.memory.SkillRisk
+import dev.touchpilot.app.demonstration.DemonstrationSession
+import dev.touchpilot.app.demonstration.DemonstrationStatus
+import dev.touchpilot.app.demonstration.formatting.DemonstrationSummaryFormatter
 import dev.touchpilot.app.navigation.SettingsPanel
 import dev.touchpilot.app.runtime.ToolExecutionController
-import dev.touchpilot.app.tools.ToolExecutionLog
 import dev.touchpilot.app.ui.dp
 import dev.touchpilot.app.ui.TouchPilotTheme as Theme
 import dev.touchpilot.app.ui.RuntimeIndicator
@@ -73,15 +88,42 @@ class SettingsScreenRenderer(
     private val demonstrationRecordingEnabled: () -> Boolean = { false },
     private val demonstrationAutoExportEnabled: () -> Boolean = { false },
     private val demonstrationSessionCount: () -> Int = { 0 },
+    private val demonstrationSessions: () -> List<DemonstrationSession> = { emptyList() },
     private val demonstrationSummaries: () -> List<String> = { emptyList() },
     private val onDemonstrationRecordingToggled: (Boolean) -> Unit = {},
     private val onDemonstrationAutoExportToggled: (Boolean) -> Unit = {},
+    private val onDemonstrationReplayRequested: (String) -> Unit = {},
 ) {
+    /**
+     * Encrypted store for the cloud provider API key. The key is encrypted with
+     * an Android Keystore-backed AES-256-GCM key before being written to
+     * SharedPreferences, and legacy plaintext keys migrate on first read.
+     */
+    private val secretStore: EncryptedSecretStore by lazy {
+        EncryptedSecretStore(
+            preferences = SharedPreferencesSecretPreferences(preferences),
+            cipher = AesGcmSecretCipher(AndroidKeystoreSecretKeyProvider()),
+            onError = { message, error -> Log.w("SettingsSecretStore", message, error) },
+        )
+    }
+
     private fun localExtensionToolStore(): LocalExtensionToolStore {
         return LocalExtensionToolStore(
             readJson = { preferences.getString("local_extension_tools", "").orEmpty() },
             writeJson = { preferences.edit().putString("local_extension_tools", it).apply() }
         )
+    }
+
+    private fun externalCapabilityPermissionStore(): ExternalCapabilityPermissionStore {
+        return ExternalCapabilityPermissionStore(
+            readJson = { preferences.getString("external_capability_permissions", "").orEmpty() },
+            writeJson = { preferences.edit().putString("external_capability_permissions", it).apply() }
+        )
+    }
+
+    private fun externalCapabilityInvoker(): ExternalCapabilityInvoker {
+        val store = externalCapabilityPermissionStore()
+        return ExternalCapabilityInvoker(ExternalCapabilityPolicy(store))
     }
 
     fun render() {
@@ -276,6 +318,26 @@ class SettingsScreenRenderer(
             )
         }
 
+        val sessions = demonstrationSessions()
+        if (sessions.isNotEmpty()) {
+            contentRoot.addView(activity.formLabel("Captured demonstrations"))
+            sessions.asReversed().forEach { session ->
+                val replayable = session.metadata.status == DemonstrationStatus.COMPLETED && session.steps.isNotEmpty()
+                contentRoot.addView(
+                    activity.timelineCard(
+                        title = session.metadata.task.ifBlank { session.sessionId },
+                        body = DemonstrationSummaryFormatter.format(session),
+                        actionHint = if (replayable) "Replay approved demonstration" else null,
+                        onClick = if (replayable) {
+                            { onDemonstrationReplayRequested(session.sessionId) }
+                        } else {
+                            null
+                        },
+                    )
+                )
+            }
+        }
+
         contentRoot.addView(activity.formLabel("Recording mode"))
         contentRoot.addView(
             skillSelectRow(
@@ -334,8 +396,16 @@ class SettingsScreenRenderer(
     private fun renderMcpPanel() {
         val savedEndpoint = preferences.getString("mcp_endpoint", "").orEmpty()
         val extensionStore = localExtensionToolStore()
+        val permissionStore = externalCapabilityPermissionStore()
+        val policy = ExternalCapabilityPolicy(permissionStore)
+        val invoker = externalCapabilityInvoker()
         val extensionLoad = extensionStore.load()
         val extensionTools = extensionLoad.tools
+        val mcpTarget = ExternalCapabilityTarget(
+            kind = ExternalCapabilityKind.MCP_SERVER,
+            endpoint = savedEndpoint,
+        )
+        val mcpGrant = permissionStore.findGrant(mcpTarget)
         contentRoot.addView(
             activity.summaryCard(
                 title = "Plugin API",
@@ -359,6 +429,45 @@ class SettingsScreenRenderer(
             setText(savedEndpoint)
         }
         contentRoot.addView(endpointInput)
+
+        contentRoot.addView(activity.formLabel("MCP server permissions"))
+        contentRoot.addView(
+            activity.timelineCard(
+                title = savedEndpoint.ifBlank { "No MCP endpoint configured" },
+                body = buildString {
+                    if (savedEndpoint.isBlank()) {
+                        appendLine("Set an endpoint above, then review and grant permissions separately from Android tools.")
+                    } else {
+                        appendLine("Default deny: list tools and call tool require an explicit grant.")
+                        appendLine("List tools: ${permissionLabel(mcpGrant?.allows(ExternalCapabilityAction.LIST_TOOLS) == true)}")
+                        appendLine("Call tool: ${permissionLabel(mcpGrant?.allows(ExternalCapabilityAction.CALL_TOOL) == true)}")
+                    }
+                },
+                actionHint = if (savedEndpoint.isBlank()) null else "Grant all MCP permissions",
+                onClick = if (savedEndpoint.isBlank()) {
+                    null
+                } else {
+                    {
+                        permissionStore.grant(
+                            target = mcpTarget,
+                            actions = setOf(
+                                ExternalCapabilityAction.LIST_TOOLS,
+                                ExternalCapabilityAction.CALL_TOOL,
+                            ),
+                        )
+                        refreshSettingsScreen()
+                    }
+                },
+            )
+        )
+        if (mcpGrant != null && savedEndpoint.isNotBlank()) {
+            contentRoot.addView(
+                activity.secondaryButton("Revoke MCP server permissions") {
+                    permissionStore.revoke(mcpTarget)
+                    refreshSettingsScreen()
+                }
+            )
+        }
 
         contentRoot.addView(activity.formLabel("Tool call"))
         val toolInput = activity.editText("MCP tool name").apply { id = R.id.mcp_tool_input }
@@ -390,7 +499,23 @@ class SettingsScreenRenderer(
                     featureFlags = mapOf("network_access" to true),
                 )
                 when (val result = extensionStore.add(LocalExtensionTool(manifest))) {
-                    is LocalExtensionParseResult.Valid -> refreshSettingsScreen()
+                    is LocalExtensionParseResult.Valid -> {
+                        val extensionTarget = ExternalCapabilityTarget(
+                            kind = ExternalCapabilityKind.LOCAL_EXTENSION,
+                            endpoint = manifest.endpoint,
+                            name = manifest.name,
+                        )
+                        val requiredFlags = policy.requiredFlagsForExtension(manifest.featureFlags)
+                        permissionStore.grant(
+                            target = extensionTarget,
+                            actions = emptySet(),
+                            featureFlags = requiredFlags,
+                        )
+                        recordMcpResult(
+                            "Registered ${manifest.name}. Review extension permissions below and grant list/call access before use."
+                        )
+                        refreshSettingsScreen()
+                    }
                     is LocalExtensionParseResult.Invalid -> {
                         recordMcpResult(
                             buildString {
@@ -448,18 +573,49 @@ class SettingsScreenRenderer(
             contentRoot.addView(activity.timelineCard("No extension tools registered", "Add a local MCP tool above to store it here."))
         } else {
             extensionTools.forEach { tool ->
+                val extensionTarget = ExternalCapabilityTarget(
+                    kind = ExternalCapabilityKind.LOCAL_EXTENSION,
+                    endpoint = tool.endpoint,
+                    name = tool.name,
+                )
+                val grant = permissionStore.findGrant(extensionTarget)
+                val requiredFlags = policy.requiredFlagsForExtension(tool.manifest.featureFlags)
                 contentRoot.addView(
                     activity.timelineCard(
                         title = tool.name,
                         body = buildString {
                             appendLine(tool.description.ifBlank { "No description provided." })
                             appendLine("api_version: ${tool.manifest.apiVersion}")
-                            append("Endpoint: ")
-                            append(tool.endpoint)
+                            appendLine("Endpoint: ${tool.endpoint}")
+                            appendLine()
+                            appendLine("Extension permissions (separate from Android tools):")
+                            appendLine("List tools: ${permissionLabel(grant?.allows(ExternalCapabilityAction.LIST_TOOLS) == true)}")
+                            appendLine("Call tool: ${permissionLabel(grant?.allows(ExternalCapabilityAction.CALL_TOOL) == true)}")
+                            if (requiredFlags.isNotEmpty()) {
+                                appendLine("Feature flags:")
+                                requiredFlags.sorted().forEach { flag ->
+                                    appendLine("- $flag: ${permissionLabel(grant?.allowsFeature(flag) == true)}")
+                                }
+                            }
                         },
-                        actionHint = "Remove tool"
-                    ) {
+                        actionHint = "Grant extension permissions",
+                        onClick = {
+                            permissionStore.grant(
+                                target = extensionTarget,
+                                actions = setOf(
+                                    ExternalCapabilityAction.LIST_TOOLS,
+                                    ExternalCapabilityAction.CALL_TOOL,
+                                ),
+                                featureFlags = requiredFlags,
+                            )
+                            refreshSettingsScreen()
+                        },
+                    )
+                )
+                contentRoot.addView(
+                    activity.secondaryButton("Remove ${tool.name}") {
                         extensionStore.remove(tool.name, tool.endpoint)
+                        permissionStore.revoke(extensionTarget)
                         refreshSettingsScreen()
                     }
                 )
@@ -474,39 +630,14 @@ class SettingsScreenRenderer(
                 recordMcpResult("Listing MCP tools...")
                 refreshSettingsScreen()
                 Thread {
-                    val result = runCatching {
-                        val client = McpHttpClient(endpoint)
-                        val initialized = client.initialize()
-                        val tools = client.listTools()
-                        ToolExecutionLog.recordAction(
-                            name = "mcp_list_tools",
-                            result = "Listed ${tools.size} MCP tool(s)",
-                            status = "ok",
-                            source = "mcp",
-                            details = "endpoint=$endpoint\ninitialized=$initialized"
-                        )
-                        buildString {
-                            appendLine("MCP initialized:")
-                            appendLine(initialized)
-                            appendLine()
-                            appendLine("Tools:")
-                            if (tools.isEmpty()) {
-                                appendLine("No tools returned.")
-                            } else {
-                                tools.forEach { tool ->
-                                    appendLine("- ${tool.name}: ${tool.description}")
-                                }
-                            }
-                        }
-                    }.getOrElse { error ->
-                        ToolExecutionLog.recordAction(
-                            name = "mcp_list_tools",
-                            result = error.message.orEmpty(),
-                            status = "fail",
-                            source = "mcp",
-                            details = "endpoint=$endpoint"
-                        )
-                        "MCP list failed: ${error.message}"
+                    val result = invokeExternalCapability(
+                        endpoint = endpoint,
+                        action = ExternalCapabilityAction.LIST_TOOLS,
+                        permissionStore = permissionStore,
+                        policy = policy,
+                        invoker = invoker,
+                    ) { target, requiredFlags ->
+                        invoker.listTools(target, requiredFlags)
                     }
                     activity.runOnUiThread {
                         recordMcpResult(result)
@@ -525,36 +656,14 @@ class SettingsScreenRenderer(
                 recordMcpResult("Calling MCP tool...")
                 refreshSettingsScreen()
                 Thread {
-                    val result = runCatching {
-                        val client = McpHttpClient(endpoint)
-                        client.initialize()
-                        val callResult = client.callTool(toolName, JSONObject(argsText))
-                        ToolExecutionLog.recordAction(
-                            name = "mcp_call_tool",
-                            result = "Called $toolName -> ${callResult.ok}",
-                            status = if (callResult.ok) "ok" else "fail",
-                            source = "mcp",
-                            details = buildString {
-                                appendLine("endpoint=$endpoint")
-                                appendLine("tool=$toolName")
-                                appendLine("args=$argsText")
-                                appendLine("message=${callResult.message}")
-                            }
-                        )
-                        "MCP $toolName -> ${callResult.ok}\n${callResult.message}"
-                    }.getOrElse { error ->
-                        ToolExecutionLog.recordAction(
-                            name = "mcp_call_tool",
-                            result = error.message.orEmpty(),
-                            status = "fail",
-                            source = "mcp",
-                            details = buildString {
-                                appendLine("endpoint=$endpoint")
-                                appendLine("tool=$toolName")
-                                appendLine("args=$argsText")
-                            }
-                        )
-                        "MCP call failed: ${error.message}"
+                    val result = invokeExternalCapability(
+                        endpoint = endpoint,
+                        action = ExternalCapabilityAction.CALL_TOOL,
+                        permissionStore = permissionStore,
+                        policy = policy,
+                        invoker = invoker,
+                    ) { target, requiredFlags ->
+                        invoker.callTool(target, toolName, JSONObject(argsText), requiredFlags)
                     }
                     activity.runOnUiThread {
                         recordMcpResult(result)
@@ -571,7 +680,7 @@ class SettingsScreenRenderer(
     private fun renderCloudPanel() {
         val savedUrl = preferences.getString("agent_provider_url", "").orEmpty()
         val savedModel = preferences.getString("agent_model", "").orEmpty()
-        val savedKey = preferences.getString("agent_api_key", "").orEmpty()
+        val savedKey = secretStore.read("agent_api_key").orEmpty()
         val configured = savedUrl.isNotBlank() && savedModel.isNotBlank() && savedKey.isNotBlank()
 
         contentRoot.addView(
@@ -610,8 +719,8 @@ class SettingsScreenRenderer(
                 preferences.edit()
                     .putString("agent_provider_url", providerInput.text.toString().trim())
                     .putString("agent_model", modelInput.text.toString().trim())
-                    .putString("agent_api_key", apiKeyInput.text.toString().trim())
                     .apply()
+                secretStore.write("agent_api_key", apiKeyInput.text.toString())
                 hideKeyboard(apiKeyInput)
                 refreshSettingsScreen()
             }.apply { id = R.id.save_cloud_api_button }
@@ -627,6 +736,44 @@ class SettingsScreenRenderer(
                 }
             )
         )
+    }
+
+    private fun permissionLabel(granted: Boolean): String = if (granted) "granted" else "denied (default)"
+
+    private fun invokeExternalCapability(
+        endpoint: String,
+        action: ExternalCapabilityAction,
+        permissionStore: ExternalCapabilityPermissionStore,
+        policy: ExternalCapabilityPolicy,
+        invoker: ExternalCapabilityInvoker,
+        execute: (ExternalCapabilityTarget, Set<String>) -> ExternalCapabilityInvokeResult,
+    ): String {
+        val extensions = localExtensionToolStore().load().tools
+        return when (
+            val invocation = ExternalCapabilityTargetResolver.resolve(
+                endpoint = endpoint,
+                extensions = extensions,
+                policy = policy,
+                action = action,
+                permissionStore = permissionStore,
+            )
+        ) {
+            is ExternalCapabilityInvocation.Ambiguous -> {
+                "Permission denied: multiple local extensions share endpoint $endpoint " +
+                    "(${invocation.extensionNames.joinToString()}). Grant permissions for one extension " +
+                    "or use a unique endpoint per extension."
+            }
+            is ExternalCapabilityInvocation.Ready -> when (
+                val outcome = execute(invocation.target, invocation.requiredFeatureFlags)
+            ) {
+                is ExternalCapabilityInvokeResult.Success -> outcome.message
+                is ExternalCapabilityInvokeResult.Denied -> "Permission denied: ${outcome.decision.reason}"
+                is ExternalCapabilityInvokeResult.Failed -> when (action) {
+                    ExternalCapabilityAction.LIST_TOOLS -> "MCP list failed: ${outcome.message}"
+                    ExternalCapabilityAction.CALL_TOOL -> "MCP call failed: ${outcome.message}"
+                }
+            }
+        }
     }
 
     private fun settingsIntro(value: String): View {
